@@ -1,44 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import math
+from math import sqrt
 import sys
 import numpy as np
 from scipy.spatial import Delaunay
 from ortools.linear_solver import pywraplp
 from collections import defaultdict
-from itertools import permutations
+from operator import itemgetter
+from wrappers import timeit
 
 
 def dist(a, b):
-    return ((a[0]-b[0])**2+(a[1]-b[1])**2)**0.5
+    return sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
 
 def circumcircle(a, b, c):
     (x1, y1), (x2, y2), (x3, y3) = a, b, c
-    A = np.array([[x3-x1,y3-y1],[x3-x2,y3-y2]])
-    Y = np.array([(x3**2 + y3**2 - x1**2 - y1**2),(x3**2+y3**2 - x2**2-y2**2)])
+    A = np.array([[x3 - x1, y3 - y1], [x3 - x2, y3 - y2]])
+    Y = np.array([(x3 ** 2 + y3 ** 2 - x1 ** 2 - y1 ** 2), (x3 ** 2 + y3 ** 2 - x2 ** 2 - y2 ** 2)])
     if np.linalg.det(A) == 0:
         return False
     Ainv = np.linalg.inv(A)
-    X = 0.5*np.dot(Ainv,Y)
-    x, y = X[0],X[1]
-    r = math.sqrt((x-x1)**2+(y-y1)**2)
+    X = 0.5 * np.dot(Ainv, Y)
+    x, y = X[0], X[1]
+    r = sqrt((x - x1) ** 2 + (y - y1) ** 2)
     return (x, y), r
 
+
 def middle(a, b):
-    return (a[0]+b[0])/2, (a[1]+b[1])/2
+    return (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+
 
 def neighbors(u, closest, depth=4):
     if depth == 0:
         return set()
     res = set()
     for v in closest[u]:
-        res |= set([v]) | neighbors(v, closest, depth-1)
+        res |= {v} | neighbors(v, closest, depth - 1)
     return res
 
+
+@timeit
 def solve(radius, cost, points):
     # Parameters
     N = len(points)
+
+    m_radius = max(radius)
 
     # Solver
     solver = pywraplp.Solver('cameras', pywraplp.Solver.CBC_MIXED_INTEGER_PROGRAMMING)
@@ -51,51 +59,55 @@ def solve(radius, cost, points):
     connected = defaultdict(set)
     possible = set()
     visited = set()
-    closest = defaultdict(set)
-    for i, j, k in triangulation.simplices:
+    for triplet in triangulation.simplices:
+        i, j, k = np.sort(triplet)
+
         center, r = circumcircle(points[i], points[j], points[k])
-        if r > max(radius):
+        if r > m_radius:
             continue
-        if all(p not in visited for p in permutations((i, j, k))):
-            camera_types = [camera_type+1 for camera_type, rad in enumerate(radius) if r <= rad]
-            for camera_type in camera_types:
-                connected[i].add((center, camera_type))
-                connected[j].add((center, camera_type))
-                connected[k].add((center, camera_type))
-                possible.add((center, camera_type))
+        if (i, j, k) not in visited:
+            for camera_type, rad in enumerate(radius, start=1):
+                if r <= rad:
+                    connected[i].add((center, camera_type))
+                    connected[j].add((center, camera_type))
+                    connected[k].add((center, camera_type))
+                    possible.add((center, camera_type))
             visited.add((i, j, k))
 
-        for (u, v) in [(i, k), (i, k), (j, k)]:
-            if (u, v) in visited or (v, u) in visited:
+        for u, v in ((i, j), (i, k), (j, k)):
+            if (u, v) in visited:
                 continue
             d = dist(points[u], points[v])
             center = middle(points[u], points[v])
-            if d > max(radius):
+            if d > m_radius:
                 continue
-            camera_types = [camera_type+1 for camera_type, rad in enumerate(radius) if rad <= d]
-            for camera_type in camera_types:
-                connected[u].add((center, camera_type))
-                connected[v].add((center, camera_type))
-                possible.add((center, camera_type))
+            for camera_type, rad in enumerate(radius, start=1):
+                if rad <= d:
+                    connected[u].add((center, camera_type))
+                    connected[v].add((center, camera_type))
+                    possible.add((center, camera_type))
             visited.add((u, v))
 
     for u, (x, y) in enumerate(points):
         camera_type = 1
-        center = (x+1, y+1)
+        center = x + 1, y + 1
         possible.add((center, camera_type))
         connected[u].add((center, camera_type))
-    
-    for u, (x, y) in enumerate(points):
-        for center, camera_type in possible:
-            if dist(center, (x, y)) <= radius[camera_type-1]:
+
+    def is_in_camera_square(center, r, point):
+        return -r <= center[0] - point[0] <= r and -r <= center[1] - point[1] <= r
+
+    for i, (center, camera_type) in enumerate(possible):
+        for u, (x, y) in enumerate(points):
+            if is_in_camera_square(center, r, (x, y)) and dist(center, (x, y)) <= r:
                 connected[u].add((center, camera_type))
-        print(" processed {:8.2f}%".format(100*(u+1)/N), file=sys.stderr, end='\r')
+        print(f"\r processed {100*(i+1)/len(possible):8.2f}%", file=sys.stderr, end='')
     print(file=sys.stderr)
 
     for center, camera_type in possible:
         var[(center, camera_type)] = solver.IntVar(0, 1, f'camera_{camera_type}_{center}')
     print(len(var), "variables", file=sys.stderr)
-    
+
     # Construct constraints
     constraints = 0
     for u in range(N):
@@ -104,10 +116,9 @@ def solve(radius, cost, points):
             possible_cameras.append(var[(center, camera_type)])
         solver.Add(solver.Sum(possible_cameras) >= 1)
         constraints += 1
-    print(constraints, "constraints", file=sys.stderr)
 
-    keys = sorted(var.keys(), key=lambda x:x[0])
-    obj_expr = solver.Sum([cost[key[1]-1] * var[key] for key in keys])
+    keys = sorted(var, key=itemgetter(0))
+    obj_expr = solver.Sum([cost[key[1] - 1] * var[key] for key in keys])
     solver.Minimize(obj_expr)
     solver.Solve()
 
